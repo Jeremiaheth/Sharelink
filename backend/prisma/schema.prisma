@@ -1,0 +1,291 @@
+// ShareLink NG - Prisma Schema
+// PostgreSQL via Supabase (or any Postgres)
+// Core entities: User, Host, Router, GuestSession, Transaction, Payout, ISP, HubSpot, Notification
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================
+// Enums
+// ============================================
+
+enum Role {
+  HOST
+  ADMIN
+  SUPER_ADMIN
+}
+
+enum HostStatus {
+  PENDING
+  ACTIVE
+  PAUSED
+  SUSPENDED
+}
+
+enum SessionStatus {
+  PENDING     // voucher issued, not yet connected
+  ACTIVE      // currently using bandwidth
+  EXPIRED     // time ran out
+  COMPLETED   // user disconnected cleanly
+  CANCELLED
+}
+
+enum PassType {
+  HOURLY
+  DAILY
+}
+
+enum TransactionStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  REFUNDED
+}
+
+enum PayoutStatus {
+  PENDING
+  PROCESSING
+  PAID
+  FAILED
+}
+
+// ============================================
+// Models
+// ============================================
+
+model User {
+  id                String    @id @default(cuid())
+  phone             String    @unique
+  email             String?   @unique
+  name              String?
+  role              Role      @default(HOST)
+  isPhoneVerified   Boolean   @default(false)
+  lastLoginAt       DateTime?
+
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  // Relations
+  host              Host?
+  refreshTokens     RefreshToken[]
+
+  @@map("users")
+}
+
+model ISP {
+  id                    String  @id @default(cuid())
+  name                  String  @unique
+  revenueSharePercent   Float   @default(0.20) // 20% to ISP
+
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  // Relations
+  hosts                 Host[]
+
+  @@map("isps")
+}
+
+model Host {
+  id            String     @id @default(cuid())
+  userId        String     @unique
+  user          User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  ispId         String?
+  isp           ISP?       @relation(fields: [ispId], references: [id])
+
+  // Profile & Location (for guest map discovery)
+  fullName      String?
+  address       String?
+  city          String?
+  state         String?
+  latitude      Float?
+  longitude     Float?
+
+  // Revenue & Status
+  sharePercentage Float    @default(25) // Host keeps 25% (as per task)
+  status          HostStatus @default(PENDING)
+  isActive        Boolean    @default(false)
+  totalEarnings   Decimal    @default(0) @db.Decimal(14, 2)
+
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  // Relations
+  router        Router?
+  sessions      GuestSession[]
+  payouts       Payout[]
+
+  @@index([status])
+  @@index([ispId])
+  @@index([latitude, longitude])
+  @@map("hosts")
+}
+
+model Router {
+  id          String    @id @default(cuid())
+  hostId      String    @unique
+  host        Host      @relation(fields: [hostId], references: [id], onDelete: Cascade)
+
+  name        String?   // e.g. "Living Room Router"
+  model       String?   // MikroTik model e.g. "hAP ac^2"
+  ipAddress   String
+  apiPort     Int       @default(8728)
+  username    String    @default("admin")
+  // SECURITY NOTE: In production, encrypt this value or use a secrets manager / env per router
+  password    String
+
+  isOnline    Boolean   @default(false)
+  lastSeenAt  DateTime?
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@map("routers")
+}
+
+model HubSpot {
+  id          String   @id @default(cuid())
+  name        String
+  address     String?
+  city        String?
+  state       String?
+  latitude    Float
+  longitude   Float
+  isActive    Boolean  @default(true)
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  sessions    GuestSession[]
+
+  @@index([latitude, longitude])
+  @@map("hub_spots")
+}
+
+model GuestSession {
+  id            String        @id @default(cuid())
+  voucherCode   String        @unique @db.VarChar(20)
+  hostId        String?
+  host          Host?         @relation(fields: [hostId], references: [id], onDelete: SetNull)
+  hubSpotId     String?
+  hubSpot       HubSpot?      @relation(fields: [hubSpotId], references: [id], onDelete: SetNull)
+
+  passType      PassType
+  amountPaid    Decimal       @db.Decimal(10, 2)
+  currency      String        @default("NGN")
+
+  purchasedAt   DateTime      @default(now())
+  startedAt     DateTime?
+  expiresAt     DateTime
+  status        SessionStatus @default(PENDING)
+
+  // Usage & guest info (for analytics / abuse detection)
+  dataUsedMb    Int?          @default(0)
+  guestPhone    String?
+  deviceInfo    String?
+
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  // Relations
+  transactions  Transaction[]
+
+  @@index([status, expiresAt])
+  @@index([hostId])
+  @@index([voucherCode])
+  @@map("guest_sessions")
+}
+
+model Transaction {
+  id                String            @id @default(cuid())
+  sessionId         String
+  session           GuestSession      @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  amount            Decimal           @db.Decimal(10, 2)
+  currency          String            @default("NGN")
+  paystackReference String            @unique
+
+  status            TransactionStatus @default(PENDING)
+  paidAt            DateTime?
+  metadata          Json?             // Store Paystack webhook payload, etc.
+
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  @@index([status])
+  @@index([paystackReference])
+  @@map("transactions")
+}
+
+model Payout {
+  id                     String       @id @default(cuid())
+  hostId                 String
+  host                   Host         @relation(fields: [hostId], references: [id], onDelete: Cascade)
+
+  amount                 Decimal      @db.Decimal(14, 2)
+  currency               String       @default("NGN")
+  paystackTransferCode   String?      @unique
+
+  status                 PayoutStatus @default(PENDING)
+  requestedAt            DateTime     @default(now())
+  processedAt            DateTime?
+  failureReason          String?
+
+  createdAt              DateTime     @default(now())
+  updatedAt              DateTime     @updatedAt
+
+  @@index([hostId, status])
+  @@map("payouts")
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String?  // for Hosts/Admins
+  phone     String?  // for Guests (WhatsApp delivery)
+  type      String   // VOUCHER_ISSUED, HOST_APPROVED, PAYOUT_PROCESSED, etc.
+  title     String
+  body      String
+  sentAt    DateTime @default(now())
+  readAt    DateTime?
+  metadata  Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([phone])
+  @@map("notifications")
+}
+
+model Otp {
+  id        String   @id @default(cuid())
+  phone     String
+  code      String   // Hashed OTP code for security
+  expiresAt DateTime
+  attempts  Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([phone])
+  @@index([expiresAt])
+  @@map("otps")
+}
+
+model RefreshToken {
+  id        String   @id @default(cuid())
+  token     String   @unique  // Hashed refresh token
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  revoked   Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@map("refresh_tokens")
+}
+
