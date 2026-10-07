@@ -1,3 +1,4 @@
+import { validateOtpConfiguration } from './modules/auth/otp-delivery.service';
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { AppController } from './app.controller';
@@ -18,6 +19,7 @@ import { AdminModule } from './modules/admin/admin.module';
       isGlobal: true,
       envFilePath: '.env',
       cache: true,
+      validate: validateOtpConfiguration,
     }),
     // Database layer (global - PrismaService available everywhere)
     PrismaModule,

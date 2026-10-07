@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
+import { OtpDeliveryService } from './otp-delivery.service';
 import { AuthService } from './auth.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { SendOtpDto } from './dto/send-otp.dto';
@@ -9,8 +10,6 @@ import * as bcrypt from 'bcrypt';
 
 describe('AuthService', () => {
   let service: AuthService;
-  let prisma: PrismaService;
-  let jwtService: JwtService;
 
   const mockPrisma = {
     otp: {
@@ -41,10 +40,14 @@ describe('AuthService', () => {
     get: jest.fn().mockReturnValue('test-secret'),
   };
 
+  const delivery = { send: jest.fn() };
+
   beforeEach(async () => {
+    delivery.send.mockReset().mockResolvedValue(undefined);
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         AuthService,
+        { provide: OtpDeliveryService, useValue: delivery },
         { provide: PrismaService, useValue: mockPrisma },
         { provide: JwtService, useValue: mockJwtService },
         { provide: ConfigService, useValue: mockConfigService },
@@ -52,8 +55,6 @@ describe('AuthService', () => {
     }).compile();
 
     service = module.get<AuthService>(AuthService);
-    prisma = module.get<PrismaService>(PrismaService);
-    jwtService = module.get<JwtService>(JwtService);
 
     // Reset mocks
     jest.clearAllMocks();
@@ -64,16 +65,41 @@ describe('AuthService', () => {
       const dto: SendOtpDto = { phone: '+2348012345678' };
       mockPrisma.otp.deleteMany.mockResolvedValue({});
       mockPrisma.otp.count.mockResolvedValue(0);
-      mockPrisma.otp.create.mockResolvedValue({});
+      mockPrisma.otp.create.mockResolvedValue({ id: 'otp-1' });
 
       const result = await service.sendOtp(dto);
 
       expect(result.message).toContain('OTP sent successfully');
       expect(mockPrisma.otp.create).toHaveBeenCalled();
-      const createCall = mockPrisma.otp.create.mock.calls[0][0].data;
+      const createArgs = mockPrisma.otp.create.mock.calls[0] as [
+        { data: { phone: string; code: string; expiresAt: Date } },
+      ];
+      const createCall = createArgs[0].data;
       expect(createCall.phone).toBe(dto.phone);
       expect(createCall.code).toBeDefined(); // hashed
       expect(createCall.expiresAt).toBeInstanceOf(Date);
+      const [, code] = delivery.send.mock.calls[0] as [string, string];
+      expect(await bcrypt.compare(code, createCall.code)).toBe(true);
+    });
+
+    it('invalidates failed delivery while preserving cooldown', async () => {
+      mockPrisma.otp.count.mockResolvedValue(0);
+      mockPrisma.otp.create.mockResolvedValue({ id: 'failed-otp' });
+      delivery.send.mockRejectedValue(new Error('delivery unavailable'));
+      await expect(
+        service.sendOtp({ phone: '+2348012345678' }),
+      ).rejects.toThrow('delivery unavailable');
+      expect(mockPrisma.otp.update).toHaveBeenCalledWith({
+        where: { id: 'failed-otp' },
+        data: { expiresAt: new Date(0) },
+      });
+      expect(mockPrisma.otp.deleteMany).toHaveBeenCalledWith({
+        where: {
+          phone: '+2348012345678',
+          expiresAt: { lt: expect.any(Date) as Date },
+          createdAt: { lt: expect.any(Date) as Date },
+        },
+      });
     });
 
     it('should throw if rate limited (recent OTP)', async () => {
@@ -84,6 +110,8 @@ describe('AuthService', () => {
       await expect(service.sendOtp(dto)).rejects.toThrow(
         'Please wait before requesting another OTP',
       );
+      expect(delivery.send).not.toHaveBeenCalled();
+      expect(mockPrisma.otp.create).not.toHaveBeenCalled();
     });
   });
 
@@ -112,7 +140,7 @@ describe('AuthService', () => {
 
       expect(result.accessToken).toBe('mock-access-token');
       expect(result.refreshToken).toBeDefined();
-      expect(result.user.phone).toBe(dto.phone);
+      expect((result.user as { phone: string }).phone).toBe(dto.phone);
       expect(mockPrisma.user.create).toHaveBeenCalled();
     });
 
