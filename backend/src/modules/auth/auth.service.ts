@@ -10,8 +10,10 @@ import { SendOtpDto } from './dto/send-otp.dto';
 import { VerifyOtpDto } from './dto/verify-otp.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { Tokens } from './interfaces/tokens.interface';
+import { User } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
+import { OtpDeliveryService } from './otp-delivery.service';
 
 const OTP_EXPIRY_MINUTES = 10;
 const MAX_OTP_ATTEMPTS = 5;
@@ -24,11 +26,12 @@ export class AuthService {
     private prisma: PrismaService,
     private jwtService: JwtService,
     private configService: ConfigService,
+    private otpDelivery: OtpDeliveryService,
   ) {}
 
   /**
    * Send OTP to phone number.
-   * In development: logs the OTP.
+   * Uses the configured delivery provider; console requires explicit development mode.
    * Cleans up expired OTPs and limits attempts.
    */
   async sendOtp(dto: SendOtpDto): Promise<{ message: string }> {
@@ -39,6 +42,7 @@ export class AuthService {
       where: {
         phone,
         expiresAt: { lt: new Date() },
+        createdAt: { lt: new Date(Date.now() - 60 * 1000) },
       },
     });
 
@@ -64,7 +68,7 @@ export class AuthService {
     const expiresAt = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000);
 
     // Store OTP
-    await this.prisma.otp.create({
+    const record = await this.prisma.otp.create({
       data: {
         phone,
         code: hashedCode,
@@ -72,11 +76,19 @@ export class AuthService {
       },
     });
 
-    // Send OTP (dev: log it)
-    await this.sendOtpToPhone(phone, code);
+    // Keep failed attempts for the resend cooldown, but make their codes unusable.
+    try {
+      await this.otpDelivery.send(phone, code);
+    } catch (error) {
+      await this.prisma.otp.update({
+        where: { id: record.id },
+        data: { expiresAt: new Date(0) },
+      });
+      throw error;
+    }
 
     return {
-      message: 'OTP sent successfully. Check your phone or console (dev mode).',
+      message: 'OTP sent successfully. Check your phone.',
     };
   }
 
@@ -102,7 +114,9 @@ export class AuthService {
     // Check attempts
     if (otpRecord.attempts >= MAX_OTP_ATTEMPTS) {
       await this.prisma.otp.delete({ where: { id: otpRecord.id } });
-      throw new UnauthorizedException('Too many failed attempts. Request new OTP.');
+      throw new UnauthorizedException(
+        'Too many failed attempts. Request new OTP.',
+      );
     }
 
     // Verify code
@@ -164,7 +178,11 @@ export class AuthService {
       include: { user: true },
     });
 
-    if (!storedToken || storedToken.revoked || storedToken.expiresAt < new Date()) {
+    if (
+      !storedToken ||
+      storedToken.revoked ||
+      storedToken.expiresAt < new Date()
+    ) {
       throw new UnauthorizedException('Invalid or expired refresh token');
     }
 
@@ -182,7 +200,9 @@ export class AuthService {
    * Generate access + refresh tokens.
    * Stores refresh token in DB for revocation support.
    */
-  private async generateTokens(user: any): Promise<Tokens> {
+  private async generateTokens(
+    user: Pick<User, 'id' | 'phone' | 'role'>,
+  ): Promise<Tokens> {
     const payload = {
       sub: user.id,
       phone: user.phone,
@@ -217,23 +237,6 @@ export class AuthService {
   }
 
   private generateOtpCode(): string {
-    return Math.floor(100000 + Math.random() * 900000).toString();
+    return crypto.randomInt(100000, 1000000).toString();
   }
-
-  private async sendOtpToPhone(phone: string, code: string): Promise<void> {
-    const message = `Your ShareLink NG OTP is ${code}. It expires in ${OTP_EXPIRY_MINUTES} minutes.`;
-
-    // Development: always log
-    console.log(`\n[DEV OTP] Phone: ${phone}`);
-    console.log(`[DEV OTP] Code: ${code}`);
-    console.log(`[DEV OTP] Message: ${message}\n`);
-
-    // Future: integrate WhatsApp / SMS provider using env vars
-    // if (process.env.WHATSAPP_API_URL && process.env.WHATSAPP_API_TOKEN) {
-    //   await this.callWhatsAppApi(phone, message);
-    // }
-  }
-
-  // Optional: implement real WhatsApp sending here later
-  // private async callWhatsAppApi(...) { ... }
 }
